@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Исчезающая кнопка (без нейросети)</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; align-items: center; justify-content: center; box-sizing: border-box; background: #f4f4f6; font-family: system-ui, sans-serif; color: #222; }
+  /* Положение кнопки: чем ближе к камере, тем надёжнее рука попадает в кадр (особенно с дальней стороны). */
+  body[data-pos="right"]  { justify-content: flex-end;   padding-right: 6vw; }
+  body[data-pos="left"]   { justify-content: flex-start; padding-left: 6vw; }
+  body[data-pos="top"]    { align-items: flex-start;     padding-top: 12vh; }
+  body[data-pos="bottom"] { align-items: flex-end;       padding-bottom: 32vh; }
+  #btn { font-size: 22px; padding: 22px 44px; border: 0; border-radius: 14px; background: #3b6fe0; color: #fff; cursor: pointer; touch-action: manipulation; user-select: none; }
+  #btn.gone { visibility: hidden; pointer-events: none; }  /* место кнопки остаётся, она просто невидима и не нажимается */
+  /* Видео на экране не показываем, но элемент должен «играть», поэтому он остаётся на странице невидимым. */
+  #video { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+  #gear { position: fixed; right: 10px; top: 10px; width: 40px; height: 40px; border: 0; border-radius: 20px; background: #ddd; font-size: 20px; opacity: .35; }
+  #panel { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px 14px; background: rgba(255,255,255,.92); box-shadow: 0 -1px 4px rgba(0,0,0,.12); font-size: 13px; color: #444; }
+  #status { white-space: pre-line; margin-bottom: 6px; }
+  .bar { position: relative; height: 18px; border-radius: 4px; background: #e3e3e8; overflow: hidden; }
+  .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #2a7de1; }
+  .bar .mark { position: absolute; top: 0; bottom: 0; width: 2px; background: #d9534f; }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+  .row input[type=range] { flex: 1; }
+  .row button { font-size: 13px; padding: 8px 10px; border: 0; border-radius: 8px; background: #777; color: #fff; }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<button id="btn">Нажми</button>
+<button id="gear" title="Панель настройки">⚙</button>
+
+<div id="panel">
+  <div id="status">Нажми кнопку — включится камера</div>
+  <div class="bar"><div class="fill" id="fill"></div><div class="mark" id="mark"></div></div>
+  <div class="row">
+    <span>Чувствительность</span>
+    <input id="sens" type="range" min="1" max="10" step="0.5" value="6">
+    <span id="sensVal">6</span>
+  </div>
+  <div class="row">
+    <span>Положение кнопки</span>
+    <select id="pos">
+      <option value="right">справа (у камеры)</option>
+      <option value="center">в центре</option>
+      <option value="left">слева</option>
+      <option value="top">сверху</option>
+      <option value="bottom">снизу</option>
+    </select>
+  </div>
+  <div class="row">
+    <button id="recal">Перекалибровать</button>
+    <small>Красная метка — порог. Когда полоса её пересекает, кнопка прячется.</small>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   БЕЗ НЕЙРОСЕТИ. Четыре простых признака, считаются ~30 раз в секунду:
+     движение — какая доля пикселей изменилась по сравнению с кадром 0,3 с назад;
+     кожа     — какая доля пикселей по цвету похожа на кожу;
+     фон      — какая доля пикселей отличается от «пустой» сцены (эталона),
+                запомненной при калибровке. Ловит и медленную руку, и руку любого цвета,
+                и неподвижную руку, которая просто лежит рядом с камерой;
+     яркость  — резкое изменение средней яркости (тень руки, закрытый свет).
+   Первые 8 секунд страница наблюдает спокойную сцену и запоминает «обычный уровень»
+   каждого признака и его разброс. Дальше она смотрит, насколько текущие значения выше
+   обычного (в «разбросах»). Признаки объединяются так: берём самый сильный и добавляем
+   половину второго по силе. Счёт выше порога — рука близко, кнопка прячется.
+   ===================================================================== */
+const W = 16, H = 12, N = W * H;
+const TICK_MS = 33;        // ~30 кадров в секунду
+const LAG = 9;             // сравниваем с кадром 9 тиков (≈0,3 с) назад
+const HI_TICKS = 2;        // сколько тиков подряд счёт выше порога, чтобы спрятать (≈0,07 с)
+const LO_TICKS = Math.round(500 / TICK_MS);   // сколько тиков спокойствия, чтобы вернуть кнопку (≈0,5 с)
+const INSTANT = 1.6;       // если счёт выше порога в 1,6 раза, прячем сразу
+const PIX_THR = 0.06;      // пиксель «изменился», если яркость сдвинулась больше чем на 6%
+const FG_THR = 0.07;       // пиксель «не как на эталоне», если отличается больше чем на 7%
+const CAL_MS = 8000;       // длительность калибровки
+const FLOOR_A = 0.02, FLOOR_S = 0.02, FLOOR_F = 0.02, FLOOR_B = 0.01;  // нижние пределы разброса
+const MAX_Z = 20;          // потолок оценки одного признака
+const SECOND_W = 0.5;      // вес второго по силе признака в общем счёте
+// «Фон» сам по себе не должен прятать кнопку: если человек просто сместился и остался на новом месте,
+// фон навсегда «отличается от эталона». Поэтому прятать можно только при признаках активности
+// (движение, кожа, яркость или резкий РОСТ фона), а удерживает спрятанной один фон не дольше SUSTAIN_MS.
+const EVID_W = 0.5;        // признак активности: событийный признак выше 50% порога
+const EVID_WINDOW = 1500;  // прятать можно, если активность была не позже чем 1,5 с назад
+const SUSTAIN_MS = 2500;   // без новой активности кнопка возвращается через 2,5 с
+const RISE_TICKS = Math.round(500 / TICK_MS);   // «рост фона» считаем за последние ~0,5 с
+const NOISE_A = TICK_MS / 4000;                 // скорость, с которой оценка «болтанки» подстраивается (≈4 с)
+const FREEZE_MS = 3000;    // после сильной активности подстройку эталона на 3 с замораживаем
+const STALE_MS = 6000;     // если 6 с ничего сильного, а «разница с фоном» держится — фон устарел
+const STALE_LVL_MS = 4000; // то же для «обычного уровня кожи»
+const LONG_TICKS = Math.round(1000 / TICK_MS);   // «медленное» окно сравнения: ~1 с
+const BG_FAST = TICK_MS / 3000;   // быстрая подстройка устаревшего эталона (около 3 с)
+// Подстройка намеренно очень медленная: за несколько секунд, пока рука приближается или уходит,
+// эталон почти не меняется (рука не «впитывается» в фон), но медленный дрейф света отслеживается.
+const ADAPT = TICK_MS / 30000;      // скорость подстройки «обычного уровня» (около 30 с)
+const BG_ADAPT = TICK_MS / 60000;   // скорость подстройки эталона фона (около минуты)
+// Предохранитель от «залипания». Рука ребёнка может долго держаться над исчезнувшей кнопкой,
+// это нормально, поэтому время большое. Если «залипла» из-за ошибки, помогает «Перекалибровать».
+const MAX_HIDDEN_MS = 20000;
+
+const btn = document.getElementById('btn');
+const video = document.getElementById('video');
+const el = id => document.getElementById(id);
+
+const small = document.createElement('canvas');
+small.width = W; small.height = H;
+const smallCtx = small.getContext('2d', { willReadFrequently: true });
+
+let camOn = false;
+let state = 'off';         // off -> cal (калибровка) -> run (работа)
+let calStart = 0;
+let calA = [], calAL = [], calS = [], calB = [], calFrames = [];
+let muA = 0, muAL = 0, muS = 0, muF = 0, muB = 0;
+let sdA = FLOOR_A, sdAL = FLOOR_A, sdS = FLOOR_S, sdF = FLOOR_F, sdB = FLOOR_B;
+let bg = new Float32Array(N), bgMean = 0;   // эталон «пустой» сцены
+let slowMean = null;       // медленно «плывущая» средняя яркость
+let history = [];
+let sens = loadSens();     // чувствительность 1..10
+let hidden = false, hiddenSince = 0, holdoffUntil = 0;
+let hiCount = 0, loCount = 0;
+let zm = 0, zl = 0, zs = 0, zf = 0, zb = 0, score = 0;
+let note = '', noteUntil = 0;
+let wake = null;
+let lastRender = 0;
+let lastEvidence = 0, lastStrong = 0;   // когда в последний раз была активность / сильная активность
+let fHist = [], sHist = [];              // недавние значения «фона» и «кожи» (чтобы видеть их рост)
+let noiseF = 0, noiseS = 0;              // насколько эти значения обычно «гуляют» сами по себе (подстраивается)
+let elevFSince = 0, elevSSince = 0;      // с какого момента «фон» / «кожа» непрерывно выше нормы
+
+function loadSens() {
+  try { const v = parseFloat(localStorage.getItem('knopka_sens4')); if (v >= 1 && v <= 10) return v; } catch (e) {}
+  return 6;
+}
+function saveSens() { try { localStorage.setItem('knopka_sens4', String(sens)); } catch (e) {} }
+function setSens(v) {
+  sens = Math.max(1, Math.min(10, v));
+  el('sens').value = sens; el('sensVal').textContent = sens;
+  saveSens();
+}
+const thrOn = () => 3 + (10 - sens) * 0.7;   // порог скрытия: чем выше чувствительность, тем он ниже
+const thrOff = () => thrOn() * 0.6;          // порог возврата кнопки (гистерезис)
+
+// Кадр -> яркости (0..1) и доля пикселей цвета кожи
+function grab() {
+  smallCtx.drawImage(video, 0, 0, W, H);
+  const d = smallCtx.getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(N);
+  let skin = 0;
+  for (let i = 0; i < N; i++) {
+    const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+    gray[i] = y / 255;
+    const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+    const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+    if (y > 40 && cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && r > g && r > b) skin++;
+  }
+  return { gray: gray, skin: skin / N };
+}
+
+const mean = a => a.reduce((s, v) => s + v, 0) / (a.length || 1);
+const std = a => { const m = mean(a); return Math.sqrt(mean(a.map(v => (v - m) * (v - m)))); };
+const clipZ = z => Math.max(0, Math.min(MAX_Z, z));
+const avg = g => { let s = 0; for (let i = 0; i < g.length; i++) s += g[i]; return s / g.length; };
+
+// Доля пикселей, отличающихся от эталона. Из обоих кадров вычитается своя средняя яркость,
+// поэтому общая смена освещения (вспышка света, автоэкспозиция) почти не мешает.
+function foreground(gray, m) {
+  let c = 0;
+  for (let i = 0; i < N; i++) {
+    if (Math.abs((gray[i] - m) - (bg[i] - bgMean)) > FG_THR) c++;
+  }
+  return c / N;
+}
+
+function finishCalibration() {
+  // эталон — средний кадр спокойной сцены
+  bg = new Float32Array(N);
+  for (const g of calFrames) for (let i = 0; i < N; i++) bg[i] += g[i] / calFrames.length;
+  bgMean = avg(bg);
+  const calF = calFrames.map(g => foreground(g, avg(g)));
+  muA = mean(calA); sdA = Math.max(std(calA), FLOOR_A);
+  muAL = mean(calAL); sdAL = Math.max(std(calAL), FLOOR_A);
+  muS = mean(calS); sdS = Math.max(std(calS), FLOOR_S);
+  muF = mean(calF); sdF = Math.max(std(calF), FLOOR_F);
+  muB = mean(calB); sdB = Math.max(std(calB), FLOOR_B);
+  calFrames = [];
+  state = 'run';
+  hiCount = loCount = 0;
+}
+
+function startCalibration() {
+  state = 'cal';
+  calStart = 0;
+  calA = []; calAL = []; calS = []; calB = []; calFrames = [];
+  history = []; slowMean = null;
+  lastEvidence = 0; lastStrong = 0; fHist = []; sHist = []; noiseF = 0; noiseS = 0;
+  elevFSince = performance.now(); elevSSince = performance.now();
+  setHidden(false, performance.now());
+}
+
+function setHidden(v, t) {
+  hidden = v;
+  hiddenSince = t;
+  btn.classList.toggle('gone', v);
+}
+
+function flash(text) { note = text; noteUntil = performance.now() + 3000; }
+
+// ----- Камера и нажатия -----
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    camOn = true;
+    startCalibration();
+    try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wake = l; }).catch(() => {}); } catch (e) {}
+  } catch (e) {
+    flash('Не удалось включить камеру: ' + e.message + '. Нужен https и разрешение на камеру.');
+  }
+}
+
+btn.addEventListener('click', async () => {
+  if (!camOn) { await startCamera(); return; }
+  if (state !== 'run') return;
+  // Кнопку нажали, значит рука дошла, а кнопка не спряталась: становимся чувствительнее.
+  setSens(sens + 0.5);
+  flash('Нажатие проскочило: чувствительность повышена до ' + sens);
+});
+
+el('sens').addEventListener('input', e => setSens(parseFloat(e.target.value)));
+el('recal').addEventListener('click', () => { if (camOn) startCalibration(); });
+el('gear').addEventListener('click', () => {
+  const p = el('panel');
+  p.style.display = p.style.display === 'none' ? 'block' : 'none';
+});
+setSens(sens);
+
+// Положение кнопки запоминается. По умолчанию справа: у планшета в книжной ориентации камера посередине правого края.
+function setPos(v) {
+  document.body.setAttribute('data-pos', v);
+  el('pos').value = v;
+  try { localStorage.setItem('knopka_pos', v); } catch (e) {}
+}
+el('pos').addEventListener('change', e => setPos(e.target.value));
+let savedPos = 'right';
+try { savedPos = localStorage.getItem('knopka_pos') || 'right'; } catch (e) {}
+setPos(savedPos);
+
+// ----- Основной цикл: ~30 раз в секунду -----
+setInterval(() => {
+  if (!camOn || video.readyState < 2) { render(); return; }
+  const now = performance.now();
+  const f = grab();
+
+  history.push(f.gray);
+  if (history.length > LONG_TICKS + 1) history.shift();
+  const prev = history[Math.max(0, history.length - 1 - LAG)];   // кадр ≈0,3 с назад
+  const prevL = history[0];                                      // кадр ≈1 с назад (медленные движения)
+
+  let changed = 0, changedL = 0;
+  for (let i = 0; i < N; i++) {
+    if (Math.abs(f.gray[i] - prev[i]) > PIX_THR) changed++;
+    if (Math.abs(f.gray[i] - prevL[i]) > PIX_THR) changedL++;
+  }
+  const m = avg(f.gray);
+  const A = changed / N;                 // доля изменившихся пикселей (движение за 0,3 с)
+  const AL = changedL / N;               // то же за ~1 с: ловит медленно приближающуюся руку
+  const S = f.skin;                      // доля «кожи»
+  if (slowMean === null) slowMean = m;
+  const B = Math.abs(m - slowMean);      // скачок яркости относительно недавнего уровня
+
+  if (state === 'cal') {
+    if (calStart === 0) calStart = now;
+    if (now - calStart > 1000) { calA.push(A); calAL.push(AL); calS.push(S); calB.push(B); calFrames.push(f.gray); }   // первую секунду пропускаем
+    slowMean += 0.01 * (m - slowMean);
+    if (now - calStart >= CAL_MS) finishCalibration();
+  } else if (state === 'run') {
+    const F = foreground(f.gray, m);     // доля пикселей, не похожих на эталон (фон)
+    zm = clipZ((A - muA) / sdA);
+    zl = clipZ((AL - muAL) / sdAL);
+    zs = clipZ((S - muS) / sdS);
+    zf = clipZ((F - muF) / sdF);
+    zb = clipZ((B - muB) / sdB);
+    // общий счёт: самый сильный признак + половина второго по силе
+    const zz = [zm, zs, zf, zb].sort((x, y) => y - x);
+    score = zz[0] + SECOND_W * zz[1];
+
+    // Признаки активности: что-то только что ИЗМЕНИЛОСЬ (движение, рост доли кожи, скачок яркости,
+    // рост фона). Смотрим именно на изменение, а не на уровень: иначе человек, который сместился и остался
+    // на новом месте, навсегда выглядел бы «активным».
+    fHist.push(F);
+    if (fHist.length > RISE_TICKS + 1) fHist.shift();
+    sHist.push(S);
+    if (sHist.length > RISE_TICKS + 1) sHist.shift();
+    // Рост считаем в долях кадра и делим на «обычную болтанку» этого значения: в беспокойной сцене
+    // (человек двигается) нужен более сильный скачок, чтобы считаться событием.
+    const dF = F - fHist[0], dS = S - sHist[0];
+    noiseF += NOISE_A * (Math.abs(dF) - noiseF);
+    noiseS += NOISE_A * (Math.abs(dS) - noiseS);
+    const zfRise = clipZ(dF / (0.02 + 2 * noiseF));
+    const zsRise = clipZ(dS / Math.max(sdS, 2 * noiseS));
+    const ev = Math.max(zm, zl, zsRise, zb, zfRise);   // изменения (по ним судим, «затихло» ли всё)
+    // Для запуска и удержания кнопки скрытой учитываем ещё и УРОВЕНЬ кожи: неподвижная рука у камеры
+    // не меняет ничего, но кожа в кадре остаётся.
+    if (ev > thrOn() * EVID_W || zs > thrOn() * EVID_W) lastEvidence = now;
+    if (ev > thrOn() * 0.8) lastStrong = now;
+    const active = now - lastEvidence < EVID_WINDOW;
+
+    if (score > thrOn()) { hiCount++; loCount = 0; }
+    else if (score < thrOff()) { loCount++; hiCount = 0; }
+
+    // Быстрое скрытие: счёт выше порога HI_TICKS тиков подряд (или сразу сильно выше) И была активность.
+    // Возврат: счёт опустился, либо давно нет новой активности (одним «фоном» кнопку долго не держим).
+    if (!hidden && now >= holdoffUntil && active && (hiCount >= HI_TICKS || score > thrOn() * INSTANT)) setHidden(true, now);
+    else if (hidden && (loCount >= LO_TICKS || now - lastEvidence > SUSTAIN_MS)) setHidden(false, now);
+
+    // Предохранитель: если кнопка прячется слишком долго, возвращаем её принудительно.
+    if (hidden && now - hiddenSince > MAX_HIDDEN_MS) {
+      setHidden(false, now);
+      holdoffUntil = now + 2500;
+      hiCount = 0;
+      flash('Кнопка пряталась слишком долго и вернулась. Если так бывает без руки, нажми «Перекалибровать».');
+    }
+
+    // «Обычный уровень» и эталон подстраиваются, когда нет сильной активности (после неё 3 с пауза,
+    // чтобы приближающаяся рука не «впиталась» в фон) и кнопка не спрятана.
+    // Если же 6 с нет ничего сильного, а разница с фоном держится (человек сместился и остался),
+    // эталон устарел: быстро переучиваем его под новое положение.
+    if (!hidden) slowMean += 0.01 * (m - slowMean);   // «недавний уровень яркости» плывёт всегда (≈3 с)
+    // «Устарел» = уровень выше нормы НЕПРЕРЫВНО несколько секунд (а не просто выше нормы сейчас:
+    // так выглядит и начало медленно приближающейся руки, её нельзя «переучивать» в норму).
+    if (zf <= 3) elevFSince = now;
+    if (zs <= 3) elevSSince = now;
+    const quiet = now - lastStrong > FREEZE_MS;
+    if (quiet) {
+      const staleF = now - elevFSince > STALE_MS;
+      const lvlRate = now - elevSSince > STALE_LVL_MS ? BG_FAST : ADAPT;
+      muA += ADAPT * (A - muA);
+      muS += lvlRate * (S - muS);
+      muF += (staleF ? BG_FAST : ADAPT) * (F - muF);
+      const bgRate = staleF ? BG_FAST : BG_ADAPT;
+      for (let i = 0; i < N; i++) bg[i] += bgRate * (f.gray[i] - bg[i]);
+      bgMean = avg(bg);
+    }
+  }
+  if (now - lastRender >= 100) { lastRender = now; render(); }   // панель обновляем реже, чем считаем
+}, TICK_MS);
+
+function render() {
+  const now = performance.now();
+  let text;
+  if (!camOn) text = note || 'Нажми кнопку — включится камера';
+  else if (state === 'cal') {
+    const left = calStart ? Math.max(0, Math.ceil((CAL_MS - (now - calStart)) / 1000)) : Math.ceil(CAL_MS / 1000);
+    text = 'Калибровка: убери руки, не двигайся ещё ' + left + ' с';
+  } else {
+    text = (now < noteUntil ? note + '\n' : '') +
+      'Работает. Счёт ' + score.toFixed(1) + ' / порог ' + thrOn().toFixed(1) +
+      '\nдвижение ' + zm.toFixed(1) + ' · кожа ' + zs.toFixed(1) + ' · фон ' + zf.toFixed(1) + ' · яркость ' + zb.toFixed(1);
+  }
+  el('status').textContent = text;
+  el('fill').style.width = (state === 'run' ? Math.min(100, score / MAX_Z * 100) : 0) + '%';
+  el('mark').style.left = Math.min(100, thrOn() / MAX_Z * 100) + '%';
+}
+render();
+</script>
+</body>
+</html>
